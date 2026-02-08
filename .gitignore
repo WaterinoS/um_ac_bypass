@@ -20,7 +20,6 @@
 # Compiled Dynamic libraries
 *.so
 *.dylib
-*.dll
 
 # Fortran module files
 *.mod
@@ -33,9 +32,22 @@
 *.lib
 
 # Executables
-*.exe
 *.out
 *.app
 
 # debug information files
 *.dwo
+/.vs
+/um_ac_bypass/Release
+/um_ac_bypass/x64/Debug
+/loader/sensfix/Release
+*.bak
+/.github/copilot-instructions.md
+*.txt
+*.ini
+*.log
+/vowac_hooks/Release
+/vowac_hooks/x64/Release
+*.xml
+/vowac_launcher/x64/Release
+/output/um_ac_bypass_Scrambled.asi
