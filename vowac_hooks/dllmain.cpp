@@ -1982,10 +1982,6 @@ NTSTATUS WINAPI HookedNtQueryDirectoryFile(
         }
     }
 
-    if (!g_pConfig || !g_pConfig->IsInMonitoredDirectory(directoryPath)) {
-        return status;
-    }
-
     // All structures have same layout for first fields, we can use generic approach
     if (FileInformationClass == FileDirectoryInformation ||
         FileInformationClass == FileFullDirectoryInformation ||
@@ -2103,9 +2099,7 @@ NTSTATUS WINAPI HookedNtQueryDirectoryFileEx(
         }
     }
 
-    if (!g_pConfig || !g_pConfig->IsInMonitoredDirectory(directoryPath)) {
-        return status;
-    }
+    //LogMessage("[NTDLL] NtQueryDirectoryFileEx - Directory: %s, Class=%d", directoryPath.c_str(), FileInformationClass);
 
     // All structures have same layout for first fields, we can use generic approach
     if (FileInformationClass == FileDirectoryInformation ||

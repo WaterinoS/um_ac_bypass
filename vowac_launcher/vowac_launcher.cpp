@@ -802,7 +802,6 @@ int main() {
 
     std::string vowacExecutable = config.GetVowacDir() + "\\vowac.exe";
     std::string hookDLL = "vowac_hooks.dll";
-    std::string bypassASI = "um_ac_bypass.asi";
 
     // Validate VOWAC executable exists
     DWORD attributes = GetFileAttributesA(vowacExecutable.c_str());
@@ -822,15 +821,6 @@ int main() {
         std::cin.get();
         return 1;
     }
-
-	attributes = GetFileAttributesA(bypassASI.c_str());
-    if (attributes == INVALID_FILE_ATTRIBUTES) {
-        std::cerr << "[ERROR] Bypass ASI not found: " << bypassASI << "\n";
-        std::cout << "Make sure um_ac_bypass.asi is in the current directory.\n";
-        std::cout << "Press Enter to exit...\n";
-        std::cin.get();
-        return 1;
-	}
 
     // Perform DLL injection
     DLLInjector injector(hookDLL, vowacExecutable);
