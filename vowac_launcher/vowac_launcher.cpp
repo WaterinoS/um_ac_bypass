@@ -713,6 +713,8 @@ public:
 
         std::cout << "[OK] Process created ..\n";
 
+        //StringExtractor::ExtractStringsFromProcess(GetProcessId(hProcess), "vowac_process_strings.txt");
+
         // Inject DLL
         bool injectionSuccess = InjectDLL(hProcess);
         if (!injectionSuccess) {
@@ -723,9 +725,6 @@ public:
 
         // Cleanup
         CloseHandle(hProcess);
-
-       //  StringExtractor::ExtractStringsFromProcess(pi.dwProcessId, "vowac_process_strings.txt");
-
 		return hProcess;
     }
 

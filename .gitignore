@@ -51,3 +51,8 @@
 *.xml
 /vowac_launcher/x64/Release
 /output/um_ac_bypass_Scrambled.asi
+*.json
+/um_ac_bypass/x64/Release/um_ac_bypass.tlog
+/vowac_emulator/x64/Release
+*.py
+/x64/Release
