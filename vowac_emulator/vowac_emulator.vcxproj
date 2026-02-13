@@ -136,6 +136,9 @@
   <ItemGroup>
     <ClCompile Include="vowac_emulator.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="find_vowac_hmac_secret.py" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

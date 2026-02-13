@@ -90,7 +90,7 @@ void printPrompt(const std::string& text) {
 
 // Constants
 const std::string API_BASE = "https://cwtglagshot.xyz/api";
-const std::string INITIAL_SECRET = "0XJuw8J8WdMVsbAAYeDaCfigrZfSLifWASLPn1FfICW3c2HI";
+const std::string INITIAL_SECRET = "7bVxJq3mT9eQpN1aLkH0rY2uZsC4dF6gW8nP5iE1oR3tU7yX";
 const std::string SK1_PREFIX = "SK1|";
 const std::string CLIENT_VERSION = "vowac-1.2.4";
 const int DEFAULT_INTERVAL = 1;
