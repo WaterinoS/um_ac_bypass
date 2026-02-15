@@ -35,13 +35,17 @@
 #define JUNK_MOV() __asm { mov eax, eax }
 #define JUNK_PAUSE() __asm { pause }
 
+#ifdef _DEBUG
+#define ADD_JUNK_CODE() ((void)0)
+#else
 #define ADD_JUNK_CODE() \
-	do { \
-		volatile int x = rand(); \
-		if (x > 0x7FFFFFFF) { \
-			JUNK_NOP(); JUNK_MOV(); JUNK_PAUSE(); \
-		} \
-	} while(0)
+		do { \
+			volatile int x = rand() & 1; \
+			if (x) { \
+				JUNK_NOP(); \
+			} \
+		} while(0)
+#endif
 
 #ifndef NT_SUCCESS
 #define NT_SUCCESS(Status) (((NTSTATUS)(Status)) >= 0)
@@ -1761,6 +1765,57 @@ namespace te::winapi::um::ac::bypass
 		ADD_JUNK_CODE();
 	}
 
+	struct ModuleCache {
+		HMODULE handle;
+		uintptr_t baseAddress;
+		uintptr_t endAddress;
+		bool isHidden;
+		DWORD lastAccess;
+	};
+
+	static std::vector<ModuleCache> g_moduleCache;
+	static std::atomic<bool> g_cacheValid{ false };
+	static std::recursive_mutex g_cacheMutex;
+	static constexpr DWORD CACHE_LIFETIME_MS = 5000;
+
+	static void RebuildModuleCache() {
+		std::lock_guard<std::recursive_mutex> lock(g_cacheMutex);
+
+		g_moduleCache.clear();
+		DWORD currentTime = GetTickCount();
+
+		std::lock_guard<std::recursive_mutex> hiddenLock(g_hiddenModulesMutex);
+		for (const auto& [name, handle] : g_hiddenModules) {
+			MODULEINFO modInfo = {};
+			if (proxy::ProxyAPI::GetModuleInformation(proxy::ProxyAPI::GetCurrentProcess(), handle, &modInfo, sizeof(modInfo))) {
+				ModuleCache cache;
+				cache.handle = handle;
+				cache.baseAddress = reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll);
+				cache.endAddress = cache.baseAddress + modInfo.SizeOfImage;
+				cache.isHidden = true;
+				cache.lastAccess = currentTime;
+				g_moduleCache.push_back(cache);
+			}
+		}
+
+		g_cacheValid.store(true);
+	}
+
+	static inline bool IsAddressInCachedModule(uintptr_t addr, bool onlyHidden = true) {
+		if (!g_cacheValid.load(std::memory_order_relaxed)) {
+			RebuildModuleCache();
+		}
+
+		// Fast path - no lock for read
+		for (const auto& cache : g_moduleCache) {
+			if (onlyHidden && !cache.isHidden) continue;
+			if (addr >= cache.baseAddress && addr < cache.endAddress) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	SIZE_T WINAPI Hooked_VirtualQuery(LPCVOID lpAddress, PMEMORY_BASIC_INFORMATION lpBuffer, SIZE_T dwLength) {
 		ADD_JUNK_CODE();
 		CallStackSpoofer spoofer;
@@ -1788,18 +1843,9 @@ namespace te::winapi::um::ac::bypass
 		}*/
 
 		{
-			//std::lock_guard<std::recursive_mutex> lock(g_hiddenModulesMutex);
-			for (const auto& [name, handle] : g_hiddenModules) {
-				MODULEINFO modInfo = {};
-				if (te::winapi::um::ac::bypass::proxy::ProxyAPI::GetModuleInformation(te::winapi::um::ac::bypass::proxy::ProxyAPI::GetCurrentProcess(), handle, &modInfo, sizeof(modInfo))) {
-					if (addr >= (uintptr_t)modInfo.lpBaseOfDll &&
-						addr < (uintptr_t)modInfo.lpBaseOfDll + modInfo.SizeOfImage) {
-
-						MaskRegionAsModule(lpBuffer, GetStr_samp());
-						//ADD_JUNK_CODE();
-						return result;
-					}
-				}
+			if (IsAddressInCachedModule(addr, true)) {
+				MaskRegionAsModule(lpBuffer, GetStr_samp());
+				return result;
 			}
 		}
 
@@ -2660,28 +2706,35 @@ namespace te::winapi::um::ac::bypass
 		ReentrancyGuard guard;
 		if (guard.IsReentrant()) return pOriginal(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead);
 
-		if (hProcess == te::winapi::um::ac::bypass::proxy::ProxyAPI::GetCurrentProcess() || hProcess == (HANDLE)-1) {
-			uintptr_t addr = reinterpret_cast<uintptr_t>(lpBaseAddress);
+		if (hProcess != te::winapi::um::ac::bypass::proxy::ProxyAPI::GetCurrentProcess() &&
+			hProcess != (HANDLE)-1) {
+			return pOriginal(hProcess, lpBaseAddress, lpBuffer, nSize, lpNumberOfBytesRead);
+		}
 
-			std::vector<MemoryRegion> localRegions;
-			{
+		uintptr_t addr = reinterpret_cast<uintptr_t>(lpBaseAddress);
+
+		// Quick range check before locking
+		bool needsProtection = false;
+		{
+			// Use atomic load to avoid lock in common case
+			if (g_spoofedMemoryRegions.size() > 0) {
 				std::lock_guard<std::recursive_mutex> lock(g_antiDetectionMutex);
-				localRegions = g_spoofedMemoryRegions;
+				for (const auto& region : g_spoofedMemoryRegions) {
+					if (addr >= region.start && addr < region.end) {
+						needsProtection = true;
+						break;
+					}
+				}
 			}
+		}
 
-			if (TryZeroReadFromRegions(
-				localRegions.data(),
-				localRegions.size(),
-				addr,
-				lpBuffer,
-				nSize,
-				lpNumberOfBytesRead,
-				"[ #TE ] Blocked ReadProcessMemory from protected region: %p",
-				lpBaseAddress)) {
-
-				ADD_JUNK_CODE();
-				return TRUE;
+		if (needsProtection) {
+			if (lpBuffer && nSize > 0) {
+				memset(lpBuffer, 0, nSize);
 			}
+			if (lpNumberOfBytesRead) *lpNumberOfBytesRead = nSize;
+			te::sdk::helper::logging::Log("[ #TE ] Blocked ReadProcessMemory: %p", lpBaseAddress);
+			return TRUE;
 		}
 
 		ADD_JUNK_CODE();
