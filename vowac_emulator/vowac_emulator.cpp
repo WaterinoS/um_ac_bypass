@@ -9,11 +9,18 @@
 #include <thread>
 #include <vector>
 #include <iomanip>
+#include <fstream>
+#include <regex>
+#include <atomic>
 #include <Windows.h>
+#include <ShlObj.h>
+#include <TlHelp32.h> 
 #include <curl/curl.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
 #include <nlohmann/json.hpp>
+
+#pragma comment(lib, "Shell32.lib")
 
 using json = nlohmann::json;
 
@@ -90,10 +97,10 @@ void printPrompt(const std::string& text) {
 
 // Constants
 const std::string API_BASE = "https://cwtglagshot.xyz/api";
-const std::string INITIAL_SECRET = "7bVxJq3mT9eQpN1aLkH0rY2uZsC4dF6gW8nP5iE1oR3tU7yX";
+const std::string INITIAL_SECRET = "rklbgifMCYwUdiqbIoHwEPpddSwiXW3YovpUKDpQQqPmVg3E";
 const std::string SK1_PREFIX = "SK1|";
 const std::string CLIENT_VERSION = "vowac-1.2.4";
-const int DEFAULT_INTERVAL = 1;
+const int DEFAULT_INTERVAL = 10;
 
 // Global session variables
 std::string g_sessionId;
@@ -104,9 +111,17 @@ std::string g_deviceName;
 std::string g_userName;
 int g_gtaPid = 0;
 
+std::atomic<bool> g_pinFound(false);
+std::atomic<bool> g_userCancelled(false);
+std::string g_detectedPin;
+
 // Random number generator
 std::random_device rd;
 std::mt19937 gen(rd());
+
+// Forward declarations
+DWORD WINAPI MonitorChatlogThread(LPVOID lpParam);
+std::string get_pin_from_user();
 
 // Callback for curl - stores response into string
 size_t WriteCallback(void* contents, size_t size, size_t nmemb, std::string* userp) {
@@ -160,40 +175,6 @@ std::string generate_machine_id() {
         oss << std::hex << std::setw(2) << std::setfill('0') << (int)hash[i];
     }
     return oss.str();
-}
-
-// Ask user for PIN input
-std::string get_pin_from_user() {
-    std::string pin;
-    while (true) {
-        std::cout << std::endl;
-        setColor(COLOR_YELLOW);
-        std::cout << "+----------------------------------------------+" << std::endl;
-        std::cout << "|  The server requires a 6-digit PIN          |" << std::endl;
-        std::cout << "|  This PIN might be sent via in-game chat    |" << std::endl;
-        std::cout << "+----------------------------------------------+" << std::endl;
-        setColor(COLOR_DEFAULT);
-        std::cout << std::endl;
-
-        printPrompt("Enter 6-digit PIN (or 'skip' to use 000000): ");
-        std::getline(std::cin, pin);
-
-        // Trim whitespace
-        pin.erase(0, pin.find_first_not_of(" \t\r\n"));
-        pin.erase(pin.find_last_not_of(" \t\r\n") + 1);
-
-        if (pin == "skip") {
-            printWarning("Using default PIN: 000000");
-            return "000000";
-        }
-
-        if (pin.length() == 6 && std::all_of(pin.begin(), pin.end(), ::isdigit)) {
-            printSuccess("PIN accepted: " + pin);
-            return pin;
-        }
-
-        printError("Invalid PIN! Must be exactly 6 digits.");
-    }
 }
 
 // Generate random nonce
@@ -388,11 +369,321 @@ bool http_post(const std::string& url, const json& payload, json& response) {
     }
 }
 
+// Get SA-MP chatlog path dynamically
+std::string get_samp_chatlog_path() {
+    char documentsPath[MAX_PATH];
+
+    if (SUCCEEDED(SHGetFolderPathA(NULL, CSIDL_PERSONAL, NULL, 0, documentsPath))) {
+        std::string chatlogPath = std::string(documentsPath) + "\\GTA San Andreas User Files\\SAMP\\chatlog.txt";
+        return chatlogPath;
+    }
+
+    printWarning("Failed to get Documents folder, using fallback path");
+    return "chatlog.txt";
+}
+
+// Extract PIN from chatlog line
+bool extract_pin_from_line(const std::string& line, std::string& pin) {
+    std::regex pin_regex1(R"(\[VOWAC\].*?PIN:\s*(\d{6}))");
+    std::regex pin_regex2(R"(PIN:\s*(\d{6}))");
+
+    std::smatch match;
+
+    // Try first pattern
+    if (std::regex_search(line, match, pin_regex1)) {
+        if (match.size() > 1) {
+            pin = match[1].str();
+            return true;
+        }
+    }
+
+    // Try fallback pattern
+    if (std::regex_search(line, match, pin_regex2)) {
+        if (match.size() > 1) {
+            pin = match[1].str();
+            return true;
+        }
+    }
+
+    return false;
+}
+
+DWORD WINAPI KeyboardListenerThread(LPVOID lpParam) {
+    while (!g_pinFound.load() && !g_userCancelled.load()) {
+        // Check if ESC is pressed
+        if (GetAsyncKeyState(VK_ESCAPE) & 0x8000) {
+            g_userCancelled.store(true);
+
+            setColor(COLOR_YELLOW);
+            std::cout << "\n[USER INPUT] ";
+            setColor(COLOR_DEFAULT);
+            std::cout << "ESC pressed - switching to manual input" << std::endl;
+
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    return 0;
+}
+
+bool is_gta_running() {
+    HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnapshot == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    PROCESSENTRY32 pe32;
+    pe32.dwSize = sizeof(PROCESSENTRY32);
+
+    bool found = false;
+    if (Process32First(hSnapshot, &pe32)) {
+        do {
+            // Case-insensitive comparison
+            std::string exeFile(pe32.szExeFile);
+            std::transform(exeFile.begin(), exeFile.end(), exeFile.begin(), ::tolower);
+
+            if (exeFile == "gta_sa.exe") {
+                found = true;
+
+                // Update global PID with actual PID
+                g_gtaPid = pe32.th32ProcessID;
+
+                printDebug("Found gta_sa.exe process (PID: " + std::to_string(g_gtaPid) + ")");
+                break;
+            }
+        } while (Process32Next(hSnapshot, &pe32));
+    }
+
+    CloseHandle(hSnapshot);
+    return found;
+}
+
+
+// Enhanced PIN retrieval with auto-detection
+std::string get_pin_with_auto_detect() {
+    // Check if GTA is running FIRST
+    if (!is_gta_running()) {
+        std::cout << std::endl;
+        setColor(COLOR_YELLOW);
+        std::cout << "+============================================================+" << std::endl;
+        std::cout << "|  GTA:SA Process Not Detected                             |" << std::endl;
+        std::cout << "+============================================================+" << std::endl;
+        setColor(COLOR_DEFAULT);
+        std::cout << std::endl;
+
+        printWarning("gta_sa.exe is not running!");
+        printInfo("Auto-detection requires GTA:SA to be active");
+        printInfo("Please start the game before using this emulator");
+        std::cout << std::endl;
+
+        setColor(COLOR_CYAN);
+        std::cout << "Options:" << std::endl;
+        std::cout << "  1. Start GTA:SA and restart this emulator" << std::endl;
+        std::cout << "  2. Enter PIN manually (game not required)" << std::endl;
+        setColor(COLOR_DEFAULT);
+        std::cout << std::endl;
+
+        // Skip auto-detection, go straight to manual input
+        return get_pin_from_user();
+    }
+
+    std::cout << std::endl;
+    setColor(COLOR_YELLOW);
+    std::cout << "+============================================================+" << std::endl;
+    std::cout << "|  PIN Auto-Detection Active                               |" << std::endl;
+    std::cout << "+============================================================+" << std::endl;
+    setColor(COLOR_DEFAULT);
+    std::cout << std::endl;
+
+    printInfo("Scanning SA-MP chatlog for VOWAC PIN...");
+    printInfo("Timeout: 5 minutes | Press ESC for manual input");
+
+    std::cout << std::endl;
+    setColor(COLOR_CYAN);
+    std::cout << "  Waiting for PIN in chatlog";
+    setColor(COLOR_DEFAULT);
+    std::cout << std::flush;
+
+    // Reset atomic flags
+    g_pinFound.store(false);
+    g_userCancelled.store(false);
+    g_detectedPin.clear();
+
+    // Start monitoring threads
+    HANDLE hChatlogThread = CreateThread(NULL, 0, MonitorChatlogThread, NULL, 0, NULL);
+    HANDLE hKeyboardThread = CreateThread(NULL, 0, KeyboardListenerThread, NULL, 0, NULL);
+
+    if (!hChatlogThread || !hKeyboardThread) {
+        printError("Failed to create monitoring threads");
+        if (hChatlogThread) CloseHandle(hChatlogThread);
+        if (hKeyboardThread) CloseHandle(hKeyboardThread);
+        return get_pin_from_user();
+    }
+
+    // Animated waiting indicator
+    const char* spinChars = "|/-\\";
+    int spinIndex = 0;
+    auto startTime = std::chrono::steady_clock::now();
+
+    while (!g_pinFound.load() && !g_userCancelled.load()) {
+        auto elapsed = std::chrono::steady_clock::now() - startTime;
+        int secondsElapsed = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+        int secondsRemaining = 300 - secondsElapsed; // 5 minutes = 300 seconds
+
+        if (secondsRemaining <= 0) {
+            break;
+        }
+
+        // Update spinner
+        std::cout << "\r";
+        setColor(COLOR_CYAN);
+        std::cout << "  Waiting for PIN in chatlog " << spinChars[spinIndex % 4] << " ";
+        setColor(COLOR_GRAY);
+        std::cout << "(" << (secondsRemaining / 60) << "m " << (secondsRemaining % 60) << "s remaining)";
+        setColor(COLOR_DEFAULT);
+        std::cout << "          " << std::flush;
+
+        spinIndex++;
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    }
+
+    // Wait for threads to finish
+    WaitForSingleObject(hChatlogThread, 1000);
+    WaitForSingleObject(hKeyboardThread, 1000);
+
+    CloseHandle(hChatlogThread);
+    CloseHandle(hKeyboardThread);
+
+    std::cout << "\r" << std::string(80, ' ') << "\r"; // Clear line
+
+    // Check results
+    if (g_pinFound.load() && !g_detectedPin.empty()) {
+        printSuccess("Auto-detected PIN: " + g_detectedPin);
+        return g_detectedPin;
+    }
+
+    if (g_userCancelled.load()) {
+        printInfo("Falling back to manual PIN entry");
+    }
+    else {
+        printWarning("No PIN detected in chatlog");
+    }
+
+    // Fallback to manual input
+    return get_pin_from_user();
+}
+
+// Original manual PIN input function (kept as fallback)
+std::string get_pin_from_user() {
+    std::string pin;
+    while (true) {
+        std::cout << std::endl;
+        setColor(COLOR_YELLOW);
+        std::cout << "+----------------------------------------------+" << std::endl;
+        std::cout << "|  The server requires a 6-digit PIN          |" << std::endl;
+        std::cout << "|  This PIN might be sent via in-game chat    |" << std::endl;
+        std::cout << "+----------------------------------------------+" << std::endl;
+        setColor(COLOR_DEFAULT);
+        std::cout << std::endl;
+
+        printPrompt("Enter 6-digit PIN (or 'skip' to use 000000): ");
+        std::getline(std::cin, pin);
+
+        // Trim whitespace
+        pin.erase(0, pin.find_first_not_of(" \t\r\n"));
+        pin.erase(pin.find_last_not_of(" \t\r\n") + 1);
+
+        if (pin == "skip") {
+            printWarning("Using default PIN: 000000");
+            return "000000";
+        }
+
+        if (pin.length() == 6 && std::all_of(pin.begin(), pin.end(), ::isdigit)) {
+            printSuccess("PIN accepted: " + pin);
+            return pin;
+        }
+
+        printError("Invalid PIN! Must be exactly 6 digits.");
+    }
+}
+
+DWORD WINAPI MonitorChatlogThread(LPVOID lpParam) {
+    std::string chatlogPath = get_samp_chatlog_path();
+
+    // Get initial file size (to skip old content)
+    std::ifstream initialCheck(chatlogPath, std::ios::ate | std::ios::binary);
+    std::streampos initialSize = initialCheck.tellg();
+    initialCheck.close();
+
+    if (initialSize == -1) {
+        printWarning("Could not determine initial chatlog size");
+        initialSize = 0;
+    }
+
+    auto startTime = std::chrono::steady_clock::now();
+    const auto timeout = std::chrono::minutes(5);
+
+    while (!g_userCancelled.load() && !g_pinFound.load()) {
+        // Check timeout
+        auto elapsed = std::chrono::steady_clock::now() - startTime;
+        if (elapsed >= timeout) {
+            printWarning("Timeout: No PIN detected in 5 minutes");
+            break;
+        }
+
+        // REOPEN file each time for fresh read
+        std::ifstream chatlog(chatlogPath, std::ios::in);
+        if (!chatlog.is_open()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            continue;
+        }
+
+        // Get current file size
+        chatlog.seekg(0, std::ios::end);
+        std::streampos currentSize = chatlog.tellg();
+
+        if (currentSize > initialSize) {
+            // New content available - read only NEW lines
+            chatlog.seekg(initialSize);
+
+            std::string newLine;
+            while (std::getline(chatlog, newLine)) {
+                std::string pin;
+                if (extract_pin_from_line(newLine, pin)) {
+                    g_detectedPin = pin;
+                    g_pinFound.store(true);
+
+                    setColor(COLOR_GREEN);
+                    std::cout << "\n[AUTO-DETECT] ";
+                    setColor(COLOR_DEFAULT);
+                    std::cout << "PIN detected: ";
+                    setColor(COLOR_CYAN);
+                    std::cout << pin << std::endl;
+                    setColor(COLOR_DEFAULT);
+
+                    chatlog.close();
+                    return 0;
+                }
+            }
+
+            // Update last known position
+            initialSize = currentSize;
+        }
+
+        chatlog.close();
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+
+    return 0;
+}
+
 // /ac/attach - session initialization
 bool attach_session() {
     printInfo("Connecting to /ac/attach...");
 
-    std::string pin = get_pin_from_user();
+    std::string pin = get_pin_with_auto_detect();
 
     json attach_payload = {
         {"pin", pin},

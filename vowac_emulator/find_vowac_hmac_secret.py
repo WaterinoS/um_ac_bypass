@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 VOWAC Binary Analyzer - Extracts HMAC secret and protocol details from vowac.exe
-Supports both plaintext secrets (v1) and obfuscated secrets (v2+, k0_obf.rs BSWAP+XOR)
+Supports plaintext (v1), BSWAP+XOR (v2), and BSWAP+ROR+dual-XOR (v3+) obfuscation
 """
 
 import struct
@@ -127,8 +127,9 @@ def try_obfuscated_secret(data, pe_info):
     obf_data = data[obf_pos:obf_pos + 48]
     non_ascii = sum(1 for b in obf_data if b > 0x7F)
 
-    # If structural method didn't find high-entropy data, fall back to scanning
-    if non_ascii < 30:
+    # If structural method didn't find obfuscated-looking data, fall back to scanning
+    # v2 data has ~38+ high bytes, v3 has ~25+, so use a low threshold
+    if non_ascii < 10:
         ac_pos = data.find(b'ac_crypto.rs', k0_pos)
         if ac_pos < 0:
             ac_pos = data.find(b'ac_crypto.rs')
@@ -145,22 +146,30 @@ def try_obfuscated_secret(data, pe_info):
         if obf_data is None:
             return None, -1, "", -1
 
-    # Step 3: Find the XOR key from the deobfuscation function
+    # Step 3: Try v3 deobfuscation first (BSWAP+ROR+dual-XOR), then v2 (BSWAP+XOR)
     text_sec = find_section(sections, '.text')
     if text_sec is None:
         return None, -1, "", -1
 
+    def is_printable_secret(b):
+        return b and all(chr(c) in string.printable and chr(c) not in '\t\n\r\x0b\x0c' for c in b)
+
+    # Try v3: extract key table and counter from the deobfuscation function
+    v3_result = try_v3_deobfuscation(data, pe_info, obf_pos, obf_data)
+    if v3_result:
+        return v3_result.decode(), obf_pos, "obfuscated (v3: BSWAP+ROR+dual-XOR)", -1
+
+    # Try v2: find XOR key
     xor_key = find_xor_key(data, pe_info, obf_pos)
     if xor_key < 0:
-        # Try common XOR keys
         for candidate_key in [0xA7, 0x5A, 0x3C, 0xFF, 0x42]:
             result = deobfuscate(obf_data, candidate_key)
-            if result and all(chr(b) in string.printable and chr(b) not in '\t\n\r\x0b\x0c' for b in result):
+            if is_printable_secret(result):
                 return result.decode(), obf_pos, f"obfuscated (BSWAP+XOR 0x{candidate_key:02X}, guessed)", candidate_key
         return None, obf_pos, "", -1
 
     result = deobfuscate(obf_data, xor_key)
-    if result and all(chr(b) in string.printable and chr(b) not in '\t\n\r\x0b\x0c' for b in result):
+    if is_printable_secret(result):
         return result.decode(), obf_pos, f"obfuscated (BSWAP+XOR 0x{xor_key:02X})", xor_key
 
     return None, obf_pos, "", xor_key
@@ -217,17 +226,130 @@ def find_xor_key(data, pe_info, obf_file_offset):
 
 
 def deobfuscate(obf_data, xor_key):
-    """Deobfuscate: BSWAP each 8-byte chunk, then XOR each byte."""
+    """Deobfuscate v2: BSWAP each 8-byte chunk, then XOR each byte."""
     if len(obf_data) != 48:
         return None
     result = bytearray()
     for i in range(6):
         chunk = obf_data[i*8:(i+1)*8]
-        # BSWAP = reverse byte order within 8-byte group
         reversed_chunk = chunk[::-1]
         for b in reversed_chunk:
             result.append(b ^ xor_key)
     return bytes(result)
+
+
+def ror8(val, count):
+    """Rotate right an 8-bit value."""
+    count = count % 8
+    return ((val >> count) | (val << (8 - count))) & 0xFF
+
+
+def deobfuscate_v3(obf_data, key_table, init_counter=0xDE):
+    """Deobfuscate v3: BSWAP + position-dependent ROR + dual XOR (key table + running counter).
+
+    Algorithm (from disassembly at VA 0x1403EDCBF in v3 binary):
+      bpl starts at 1 (increments per chunk), r15b starts at init_counter.
+      For each 8-byte chunk (chunk_idx 0..5):
+        bswap the chunk, then for each byte position r8 (0..7):
+          r14 = chunk_idx + r8 (inner counter)
+          rotation = uint8(bpl - uint8((r14//7)*7)) + r8
+          decoded = key_table[r8] ^ r15b ^ ror8(bswapped[r8], rotation)
+          r15b += bpl
+        After chunk: bpl++, r15b = saved_r15b + 0xA7
+    """
+    if len(obf_data) != 48 or len(key_table) != 8:
+        return None
+    result = bytearray()
+    bpl = 1
+    r15b = init_counter
+    for chunk_idx in range(6):
+        chunk = obf_data[chunk_idx*8:(chunk_idx+1)*8]
+        bswapped = chunk[::-1]  # BSWAP reverses byte order
+        saved_r15b = r15b
+        r14 = chunk_idx
+        for r8 in range(8):
+            div_result = r14 // 7
+            mul_result = div_result * 7
+            cl = (bpl - (mul_result & 0xFF)) & 0xFF
+            cl = (cl + r8) & 0xFF
+            rotated = ror8(bswapped[r8], cl)
+            dl = key_table[r8] ^ r15b ^ rotated
+            result.append(dl)
+            r14 += 1
+            r15b = (r15b + bpl) & 0xFF
+        bpl = (bpl + 1) & 0xFF
+        r15b = (saved_r15b + 0xA7) & 0xFF
+    return bytes(result)
+
+
+def try_v3_deobfuscation(data, pe_info, obf_file_offset, obf_data):
+    """Try v3 deobfuscation by extracting key table and init counter from the deobfuscation function.
+
+    Looks for the function that references the obfuscated data via LEA (not MOVUPS).
+    The function contains two MOVABS instructions loading the key table constant and
+    an 'mov r15b, IMM8' for the initial counter, plus 'mov esi, 7' as a signature.
+    """
+    sections = pe_info['sections']
+    image_base = pe_info['image_base']
+    text_sec = find_section(sections, '.text')
+    if text_sec is None:
+        return None
+
+    obf_rva = file_to_rva(sections, obf_file_offset)
+    if obf_rva is None:
+        return None
+    obf_va = image_base + obf_rva
+
+    text_start = text_sec['rawoff']
+    text_end = text_start + text_sec['rawsize']
+
+    # Find LEA reg, [rip+disp32] referencing the obfuscated data
+    ref_locations = []
+    for i in range(text_start, text_end - 7):
+        # LEA r8, [rip+disp32] = 4C 8D 05 xx xx xx xx
+        # LEA rax, [rip+disp32] = 48 8D 05 xx xx xx xx
+        # LEA rcx, [rip+disp32] = 48 8D 0D xx xx xx xx
+        if data[i] in (0x48, 0x4C) and data[i+1] == 0x8D and (data[i+2] & 0xC7) == 0x05:
+            disp32 = struct.unpack_from('<i', data, i + 3)[0]
+            rva = file_to_rva(sections, i + 7)
+            if rva is None:
+                continue
+            next_ip_va = image_base + rva
+            target = next_ip_va + disp32
+            if target == obf_va:
+                ref_locations.append(i)
+
+    for ref_loc in ref_locations:
+        # Search backwards (up to 128 bytes) for the function prologue area
+        # Look for MOVABS rax, IMM64 (48 B8 xx*8) which loads the key table constant
+        # and 'mov r15b, IMM8' (41 B7 xx) for init counter
+        search_start = max(text_start, ref_loc - 128)
+        key_table_val = None
+        init_counter = None
+
+        for j in range(search_start, ref_loc):
+            # movabs rax, imm64 = 48 B8 xx xx xx xx xx xx xx xx
+            if data[j] == 0x48 and data[j+1] == 0xB8 and j + 10 <= len(data):
+                val = struct.unpack_from('<Q', data, j + 2)[0]
+                # Check if this is followed by a store to [rsp+0x40] which is the key table
+                # Look for 'mov [rsp+0x40], rax' = 48 89 44 24 40
+                for k in range(j + 10, min(j + 20, len(data) - 5)):
+                    if (data[k] == 0x48 and data[k+1] == 0x89 and
+                        data[k+2] == 0x44 and data[k+3] == 0x24 and data[k+4] == 0x40):
+                        key_table_val = val
+                        break
+
+            # mov r15b, imm8 = 41 B7 xx
+            if data[j] == 0x41 and data[j+1] == 0xB7:
+                init_counter = data[j+2]
+
+        if key_table_val is not None and init_counter is not None:
+            key_table = struct.pack('<Q', key_table_val)
+            result = deobfuscate_v3(obf_data, key_table, init_counter)
+            if result and all(chr(b) in string.printable and chr(b) not in '\t\n\r\x0b\x0c' for b in result):
+                return result
+
+    return None
 
 
 def find_format_pieces(data, pe_info):
@@ -356,6 +478,7 @@ def main():
     known_secrets = [
         b'0XJuw8J8WdMVsbAAYeDaCfigrZfSLifWASLPn1FfICW3c2HI',
         b'7bVxJq3mT9eQpN1aLkH0rY2uZsC4dF6gW8nP5iE1oR3tU7yX',
+        b'rklbgifMCYwUdiqbIoHwEPpddSwiXW3YovpUKDpQQqPmVg3E',
     ]
     for ks in known_secrets:
         pos = data.find(ks)
