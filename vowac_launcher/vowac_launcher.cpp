@@ -585,90 +585,91 @@ public:
         return INVALID_HANDLE_VALUE;
     }
 
-    // Inject DLL into target process using CreateRemoteThread
     bool InjectDLL(HANDLE hProcess) {
-        // Get absolute path to DLL
         char fullDLLPath[MAX_PATH] = {};
         if (!GetFullPathNameA(dllPath.c_str(), MAX_PATH, fullDLLPath, nullptr)) {
             std::cerr << "[ERROR] Failed to get full DLL path\n";
             return false;
         }
 
-        std::cout << "[DEBUG] Full DLL path: " << fullDLLPath << "\n";
+        std::cout << "[DEBUG] Classic LoadLibraryA injection: " << fullDLLPath << "\n";
 
-        // Allocate memory in target process
-        SIZE_T dllPathSize = strlen(fullDLLPath) + 1;
-        LPVOID pDLLPath = VirtualAllocEx(hProcess, nullptr, dllPathSize, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-
-        if (!pDLLPath) {
-            std::cerr << "[ERROR] Failed to allocate memory in target process\n";
+        // Verify DLL exists
+        DWORD fileAttr = GetFileAttributesA(fullDLLPath);
+        if (fileAttr == INVALID_FILE_ATTRIBUTES) {
+            std::cerr << "[ERROR] DLL file not found: " << fullDLLPath << "\n";
             return false;
         }
 
-        std::cout << "[DEBUG] Allocated memory at: " << pDLLPath << "\n";
+        // Allocate memory for DLL path
+        SIZE_T pathLength = strlen(fullDLLPath) + 1;
+        LPVOID pRemotePath = VirtualAllocEx(hProcess, nullptr, pathLength,
+            MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-        // Write DLL path into target process memory
-        if (!WriteProcessMemory(hProcess, pDLLPath, fullDLLPath, dllPathSize, nullptr)) {
-            std::cerr << "[ERROR] Failed to write DLL path to target process memory\n";
-            VirtualFreeEx(hProcess, pDLLPath, 0, MEM_RELEASE);
+        if (!pRemotePath) {
+            DWORD error = GetLastError();
+            std::cerr << "[ERROR] Failed to allocate memory. Error: " << error << "\n";
             return false;
         }
 
-        std::cout << "[DEBUG] DLL path written to process memory\n";
+        // Write DLL path
+        if (!WriteProcessMemory(hProcess, pRemotePath, fullDLLPath, pathLength, nullptr)) {
+            DWORD error = GetLastError();
+            std::cerr << "[ERROR] Failed to write DLL path. Error: " << error << "\n";
+            VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
+            return false;
+        }
 
-        // Get LoadLibraryA function address from kernel32.dll
+        // Get LoadLibraryA
         HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
         if (!hKernel32) {
-            std::cerr << "[ERROR] Failed to get kernel32.dll handle\n";
-            VirtualFreeEx(hProcess, pDLLPath, 0, MEM_RELEASE);
+            std::cerr << "[ERROR] Failed to get kernel32.dll\n";
+            VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
             return false;
         }
 
-        FARPROC pLoadLibraryA = GetProcAddress(hKernel32, "LoadLibraryA");
+        PTHREAD_START_ROUTINE pLoadLibraryA = (PTHREAD_START_ROUTINE)GetProcAddress(hKernel32, "LoadLibraryA");
         if (!pLoadLibraryA) {
-            std::cerr << "[ERROR] Failed to get LoadLibraryA address\n";
-            VirtualFreeEx(hProcess, pDLLPath, 0, MEM_RELEASE);
+            std::cerr << "[ERROR] Failed to get LoadLibraryA\n";
+            VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
             return false;
         }
 
-        std::cout << "[DEBUG] LoadLibraryA address: " << pLoadLibraryA << "\n";
-
-        // Create remote thread to load DLL
-        HANDLE hThread = CreateRemoteThread(
-            hProcess,
-            nullptr,
-            0,
-            (LPTHREAD_START_ROUTINE)pLoadLibraryA,
-            pDLLPath,
-            0,
-            nullptr
-        );
+        // Create remote thread
+        HANDLE hThread = CreateRemoteThread(hProcess, nullptr, 0, pLoadLibraryA, pRemotePath, 0, nullptr);
 
         if (!hThread) {
-            DWORD lastError = GetLastError();
-            std::cerr << "[ERROR] Failed to create remote thread. Error code: " << lastError << "\n";
-            VirtualFreeEx(hProcess, pDLLPath, 0, MEM_RELEASE);
+            DWORD error = GetLastError();
+            std::cerr << "[ERROR] CreateRemoteThread failed. Error: " << error << "\n";
+            VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
             return false;
         }
 
-        std::cout << "[DEBUG] Remote thread created: " << hThread << "\n";
-
-        // Wait for thread completion
-        DWORD waitResult = WaitForSingleObject(hThread, 5000); // 5 second timeout
-        if (waitResult == WAIT_TIMEOUT) {
-            std::cerr << "[ERROR] Remote thread execution timed out\n";
+        // Wait for completion
+        DWORD waitResult = WaitForSingleObject(hThread, 10000);
+        if (waitResult != WAIT_OBJECT_0) {
+            std::cerr << "[ERROR] Thread wait failed\n";
+            CloseHandle(hThread);
+            VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
+            return false;
         }
 
-        DWORD threadExitCode = 0;
-        if (GetExitCodeThread(hThread, &threadExitCode)) {
-            std::cout << "[DEBUG] Remote thread exit code: " << threadExitCode << "\n";
+        // Check result
+        DWORD exitCode = 0;
+        if (GetExitCodeThread(hThread, &exitCode)) {
+            if (exitCode == 0) {
+                std::cerr << "[ERROR] LoadLibraryA returned NULL\n";
+                CloseHandle(hThread);
+                VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
+                return false;
+            }
+            std::cout << "[OK] DLL loaded at: 0x" << std::hex << exitCode << std::dec << "\n";
         }
 
-        // Cleanup
         CloseHandle(hThread);
-        VirtualFreeEx(hProcess, pDLLPath, 0, MEM_RELEASE);
+        VirtualFreeEx(hProcess, pRemotePath, 0, MEM_RELEASE);
 
-        std::cout << "[OK] DLL injected successfully\n";
+        std::cout << "[OK] Injection completed\n";
         return true;
     }
 
@@ -680,57 +681,113 @@ public:
         return ".\\";
     }
 
-    // Launch VOWAC process and inject DLL
+    // Build environment block: inherit parent env + add proxy vars
+    std::vector<char> BuildProxyEnvironment() {
+        std::vector<char> envBlock;
+
+        // Get parent environment
+        LPCH parentEnv = GetEnvironmentStrings();
+        if (parentEnv) {
+            // Environment block is double-null-terminated sequence of "KEY=VALUE\0"
+            LPCH p = parentEnv;
+            while (*p) {
+                size_t len = strlen(p) + 1; // include null
+                envBlock.insert(envBlock.end(), p, p + len);
+                p += len;
+            }
+            FreeEnvironmentStrings(parentEnv);
+        }
+
+        // Add proxy variables
+        const char* proxyVars[] = {
+            "HTTP_PROXY=http://127.0.0.1:8080",
+            "HTTPS_PROXY=http://127.0.0.1:8080",
+            "http_proxy=http://127.0.0.1:8080",
+            "https_proxy=http://127.0.0.1:8080",
+        };
+        for (const char* var : proxyVars) {
+            size_t len = strlen(var) + 1;
+            envBlock.insert(envBlock.end(), var, var + len);
+        }
+
+        // Double-null terminator
+        envBlock.push_back('\0');
+        return envBlock;
+    }
+
     HANDLE LaunchAndInject() {
         std::string vowacDir = GetDirectoryFromPath(targetExecutable);
-        std::wstring wideVowacDir(vowacDir.begin(), vowacDir.end());
 
-        int len = MultiByteToWideChar(CP_ACP, 0, targetExecutable.c_str(), -1, nullptr, 0);
-        wchar_t* wideExePath = new wchar_t[len];
-        MultiByteToWideChar(CP_ACP, 0, targetExecutable.c_str(), -1, wideExePath, len);
+        std::cout << "[*] Creating VOWAC process in SUSPENDED state...\n";
 
-        HINSTANCE hResult = ShellExecuteW(
-            nullptr,
-            L"open",
-            wideExePath,
-            nullptr,
-            wideVowacDir.c_str(),
-            SW_SHOW
+        // Build environment with proxy for traffic capture
+       // std::vector<char> envBlock = BuildProxyEnvironment();
+       // std::cout << "[*] Proxy env set: HTTP(S)_PROXY=http://127.0.0.1:8080\n";
+
+        STARTUPINFOA si = {};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi = {};
+
+        // Create process SUSPENDED
+        BOOL success = CreateProcessA(
+            targetExecutable.c_str(),  // Application name
+            nullptr,                   // Command line
+            nullptr,                   // Process security attributes
+            nullptr,                   // Thread security attributes
+            FALSE,                     // Inherit handles
+            CREATE_SUSPENDED,          // Creation flags - SUSPENDED!
+            nullptr/*envBlock.data()*/,           // Environment with proxy
+            vowacDir.c_str(),         // Current directory
+            &si,                       // Startup info
+            &pi                        // Process information
         );
 
-        delete[] wideExePath;
-
-        if ((intptr_t)hResult <= 32) {
-            std::cerr << "[ERROR] ShellExecute failed with error: " << (intptr_t)hResult << "\n";
+        if (!success) {
+            DWORD error = GetLastError();
+            std::cerr << "[ERROR] Failed to create process. Error: " << error << "\n";
             return INVALID_HANDLE_VALUE;
         }
 
-		HANDLE hProcess = WaitForProcessByName("vowac.exe", 5000); 
-		if (hProcess == INVALID_HANDLE_VALUE) {
-            std::cerr << "[ERROR] Failed to find VOWAC process after launch\n";
+        std::cout << "[OK] Process created in SUSPENDED state (PID: " << pi.dwProcessId << ")\n";
+        std::cout << "[DEBUG] Main thread ID: " << pi.dwThreadId << "\n";
+
+        // Now inject DLL while process is suspended
+        std::cout << "[*] Injecting DLL into suspended process...\n";
+
+        if (!InjectDLL(pi.hProcess)) {
+            std::cerr << "[ERROR] DLL injection failed\n";
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
             return INVALID_HANDLE_VALUE;
         }
 
-        std::cout << "[OK] Process created ..\n";
+        std::cout << "[OK] DLL injected successfully\n";
+        std::cout << "[*] Resuming main thread...\n";
 
-        //StringExtractor::ExtractStringsFromProcess(GetProcessId(hProcess), "vowac_process_strings.txt");
-
-        // Inject DLL
-        bool injectionSuccess = InjectDLL(hProcess);
-        if (!injectionSuccess) {
-            std::cout << "[ERROR] Injection failed, terminating process...\n";
-            TerminateProcess(hProcess, 1);
-			return INVALID_HANDLE_VALUE;
+        // Resume the main thread - VOWAC will now start with DLL already loaded
+        DWORD suspendCount = ResumeThread(pi.hThread);
+        if (suspendCount == (DWORD)-1) {
+            std::cerr << "[ERROR] Failed to resume thread\n";
+            TerminateProcess(pi.hProcess, 1);
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            return INVALID_HANDLE_VALUE;
         }
 
-        // Cleanup
-        CloseHandle(hProcess);
-		return hProcess;
+        std::cout << "[OK] Main thread resumed (suspend count was: " << suspendCount << ")\n";
+        std::cout << "[SUCCESS] VOWAC started with vowac_hooks.dll already loaded!\n";
+
+        // Close thread handle (we don't need it anymore)
+        CloseHandle(pi.hThread);
+
+        // Return process handle for potential future use
+        return pi.hProcess;
     }
 
     bool InjectOnlyDLL(HANDLE hProcess)
     {
-	    return InjectDLL(hProcess);
+        return InjectDLL(hProcess);
     }
 };
 
@@ -740,7 +797,7 @@ int main() {
     SetConsoleOutputCP(65001);
 
     std::cout << "====================================================================\n";
-    std::cout << "   VOWAC Launcher - Bypass Loader & Configuration Utility   \n";
+    std::cout << "   VOWAC Launcher - Bypass Loader & Configuration Utility\n";
     std::cout << "====================================================================\n\n";
 
     VowacConfig config;
@@ -823,7 +880,7 @@ int main() {
 
     // Perform DLL injection
     DLLInjector injector(hookDLL, vowacExecutable);
-	HANDLE hVowac = injector.LaunchAndInject();
+    HANDLE hVowac = injector.LaunchAndInject();
     if (hVowac == INVALID_HANDLE_VALUE) {
         std::cerr << "\n[ERROR] Failed to inject DLL into VOWAC process\n";
         std::cout << "Press Enter to exit...\n";
@@ -831,33 +888,8 @@ int main() {
         return 1;
     }
 
- //   std::cout << "\n[*] Waiting for gta_sa.exe to start...\n";
- //   DLLInjector gtaInjector(bypassASI, "gta_sa.exe");
- //   HANDLE hGTA = gtaInjector.WaitForProcessByName("gta_sa.exe", 120000);
- //   if (hGTA == INVALID_HANDLE_VALUE) {
- //       std::cerr << "\n[ERROR] GTA SA process not found!\n";
- //       std::cout << "Press Enter to exit...\n";
- //       std::cin.get();
- //       return 1;
- //   }
-
-	//std::cout << "\n[*] GTA SA process detected, waiting for it to initialize... (10s)\n";
- //   Sleep(10000);
-
- //   std::cout << "\n[*] Injecting bypass ASI into gta_sa.exe...\n";
- //   if (!gtaInjector.InjectOnlyDLL(hGTA)) {
- //       std::cerr << "\n[ERROR] Failed to inject bypass ASI into GTA SA process\n";
- //       std::cout << "Press Enter to exit...\n";
- //       std::cin.get();
- //       return 1;
- //   }
-
- //   CloseHandle(hGTA);
-
-    std::cout << "\n============================================\n";
-    std::cout << " VOWAC launched with active file monitoring\n";
-    std::cout << "============================================\n";
-    std::cout << "Press Enter to exit...\n";
+    std::cout << "\n[OK] VOWAC launched with hooks active\n";
+    std::cout << "Press Enter to exit launcher (VOWAC will continue running)...\n";
     std::cin.get();
 
     return 0;
